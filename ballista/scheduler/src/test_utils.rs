@@ -644,6 +644,11 @@ impl SchedulerTest {
             .with_ballista_adaptive_query_planner(enabled);
     }
 
+    /// The scheduler under test.
+    pub fn scheduler(&self) -> &SchedulerServer<LogicalPlanNode, PhysicalPlanNode> {
+        &self.scheduler
+    }
+
     /// Whether `job`'s execution graph is active, which is when the
     /// scheduler's event handlers (for example, on executor loss) see it. A
     /// job's status turns `Running` just before this.

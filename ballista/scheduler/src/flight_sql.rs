@@ -83,7 +83,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryBackend
                     pipelined_output_locations,
                     ..
                 })) if !pipelined_output_locations.is_empty() => {
-                    let schema = self.result_schema(&job_id, &ctx, &plan).await?;
+                    let output_stage = output_stage_id(
+                        pipelined_output_locations
+                            .iter()
+                            .filter_map(|location| location.partition_id.as_ref())
+                            .map(|partition_id| partition_id.stage_id),
+                    );
+                    let schema = self
+                        .result_schema(&job_id, &ctx, &plan, output_stage)
+                        .await?;
                     return Ok(QueryResult {
                         job_id: job_id.to_string(),
                         schema,
@@ -102,7 +110,15 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> QueryBackend
                     partition_location,
                     ..
                 })) => {
-                    let schema = self.result_schema(&job_id, &ctx, &plan).await?;
+                    let output_stage = output_stage_id(
+                        partition_location
+                            .iter()
+                            .filter_map(|location| location.partition_id.as_ref())
+                            .map(|partition_id| partition_id.stage_id),
+                    );
+                    let schema = self
+                        .result_schema(&job_id, &ctx, &plan, output_stage)
+                        .await?;
                     return Ok(QueryResult {
                         job_id: job_id.to_string(),
                         schema,
@@ -138,13 +154,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     /// ADBC among them, rejects the result outright.
     ///
     /// The job's final stage is the plan that wrote those files, so its schema
-    /// is read from there. Only if the graph is no longer available is the plan
-    /// planned again, which for a listing table means listing its files again.
+    /// is read from there. `output_stage` is the id of that stage as recorded
+    /// in the result's output locations. It has to come from there: the
+    /// adaptive graph never fills in `output_links`, so every one of its
+    /// stages looks final, and picking one from the stage map would return an
+    /// arbitrary (possibly intermediate) stage's schema. Without an id, a stage
+    /// is used only if it is the single stage with no output links.
+    ///
+    /// Only if no stage can be identified, or the graph is no longer
+    /// available, is the plan planned again, which for a listing table means
+    /// listing its files again.
     async fn result_schema(
         &self,
         job_id: &JobId,
         ctx: &SessionContext,
         plan: &LogicalPlan,
+        output_stage: Option<usize>,
     ) -> Result<SchemaRef> {
         let graph = self
             .state
@@ -152,16 +177,146 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
             .get_job_execution_graph(job_id)
             .await?;
         let final_stage_schema = graph.and_then(|graph| {
-            graph
-                .stages()
-                .values()
-                .find(|stage| stage.output_links().is_empty())
-                .map(|stage| stage.plan().schema())
+            let stages = graph.stages();
+            let stage = match output_stage {
+                Some(stage_id) => stages.get(&stage_id),
+                None => {
+                    let mut final_stages = stages
+                        .values()
+                        .filter(|stage| stage.output_links().is_empty());
+                    match (final_stages.next(), final_stages.next()) {
+                        (Some(stage), None) => Some(stage),
+                        _ => None,
+                    }
+                }
+            };
+            stage.map(|stage| stage.plan().schema())
         });
 
         match final_stage_schema {
             Some(schema) => Ok(schema),
             None => Ok(ctx.state().create_physical_plan(plan).await?.schema()),
         }
+    }
+}
+
+/// The id of the stage that wrote a job's result, read from the stage ids of
+/// its output locations. `None` when there are no locations or they disagree.
+fn output_stage_id(stage_ids: impl IntoIterator<Item = u32>) -> Option<usize> {
+    let mut stage_ids = stage_ids.into_iter();
+    let first = stage_ids.next()?;
+    stage_ids
+        .all(|stage_id| stage_id == first)
+        .then_some(first as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ballista_core::error::Result;
+    use ballista_core::serde::protobuf::{SuccessfulJob, job_status};
+    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch};
+    use datafusion::arrow::datatypes::Schema;
+
+    use super::output_stage_id;
+    use crate::config::SchedulerConfig;
+    use crate::test_utils::{SchedulerTest, TestMetricsCollector};
+
+    #[test]
+    fn output_stage_id_needs_one_agreed_stage() {
+        assert_eq!(output_stage_id([]), None);
+        assert_eq!(output_stage_id([3, 3, 3]), Some(3));
+        assert_eq!(output_stage_id([3, 2]), None);
+    }
+
+    // Under the adaptive planner every stage has empty `output_links`, so the
+    // result schema has to come from the stage named by the output locations
+    // rather than from whichever stage the stage map yields first.
+    #[tokio::test]
+    async fn result_schema_is_the_final_stage_schema_under_adaptive_planner() -> Result<()>
+    {
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default(),
+            Arc::new(TestMetricsCollector::default()),
+            4,
+            1,
+            None,
+        )
+        .await?;
+        test.set_adaptive_planner(true);
+
+        let ctx = test.ctx().await?;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "a",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            (
+                "c",
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2])) as ArrayRef,
+            ),
+        ])?;
+        ctx.register_batch("t", batch)?;
+        let plan = ctx
+            .sql("SELECT c, min(a) FROM t GROUP BY c")
+            .await?
+            .logical_plan()
+            .clone();
+        let (status, job_id) = test.run("job", &plan).await?;
+        let Some(job_status::Status::Successful(SuccessfulJob {
+            partition_location,
+            ..
+        })) = status.status
+        else {
+            panic!("job did not succeed: {status:?}");
+        };
+
+        let output_stage = output_stage_id(
+            partition_location
+                .iter()
+                .filter_map(|location| location.partition_id.as_ref())
+                .map(|partition_id| partition_id.stage_id),
+        );
+        assert!(
+            output_stage.is_some(),
+            "no output stage in {partition_location:?}"
+        );
+
+        let scheduler = test.scheduler();
+        let graph = scheduler
+            .state
+            .task_manager
+            .get_job_execution_graph(&job_id)
+            .await?
+            .expect("graph of the finished job");
+        let stages = graph.stages();
+        // The ambiguity this guards against: more than one stage looks final.
+        assert!(
+            stages
+                .values()
+                .filter(|stage| stage.output_links().is_empty())
+                .count()
+                > 1
+        );
+
+        let expected = ctx.state().create_physical_plan(&plan).await?.schema();
+        let schema = scheduler
+            .result_schema(&job_id, &ctx, &plan, output_stage)
+            .await?;
+        assert_eq!(field_names(&schema), field_names(&expected));
+
+        // Every stage that is not the output stage has a different schema
+        // (the partial aggregate), which the old lookup could return.
+        for (stage_id, stage) in stages {
+            if Some(*stage_id) != output_stage {
+                assert_ne!(field_names(&stage.plan().schema()), field_names(&expected));
+            }
+        }
+        Ok(())
+    }
+
+    fn field_names(schema: &Schema) -> Vec<String> {
+        schema.fields().iter().map(|f| f.name().clone()).collect()
     }
 }
